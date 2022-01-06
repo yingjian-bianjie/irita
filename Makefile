@@ -58,7 +58,8 @@ ldflags = -X github.com/cosmos/cosmos-sdk/version.Name=irita \
 		  -X github.com/tendermint/tendermint/crypto/algo.Algo=sm2 \
 		  -X github.com/bianjieai/irita/address.Bech32ChainPrefix=i \
 		  -X github.com/bianjieai/irita/address.PrefixAcc=a \
-		  -X github.com/bianjieai/irita/address.PrefixAddress=a
+		  -X github.com/bianjieai/irita/address.PrefixAddress=a \
+		  -X github.com/bianjieai/ethermint/types/chain_id.EvmChainID=1
 
 buildflags = -X github.com/tendermint/tendermint/crypto/algo.Algo=sm2
 
