@@ -221,6 +221,10 @@ func (ac appCreator) newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, 
 	}
 
 	snapshotDir := filepath.Join(cast.ToString(appOpts.Get(flags.FlagHome)), "data", "snapshots")
+	err = os.MkdirAll(snapshotDir, 0777)
+	if err != nil {
+		panic(err)
+	}
 	snapshotDB, err := sdk.NewLevelDB("metadata", snapshotDir)
 	if err != nil {
 		panic(err)
