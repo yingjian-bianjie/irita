@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -50,6 +51,8 @@ import (
 	evmclient "github.com/bianjieai/irita/modules/evm/client"
 	evmserver "github.com/bianjieai/irita/modules/evm/server"
 )
+
+var IAVLSize = "5000000"
 
 // NewRootCmd creates a new root command for simd. It is called once in the main function.
 func NewRootCmd() (*cobra.Command, params.EncodingConfig) {
@@ -231,6 +234,8 @@ func (ac appCreator) newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, 
 		panic(err)
 	}
 
+	fmt.Println("IAVL Size: ", IAVLSize)
+
 	return app.NewIritaApp(
 		logger, db, traceStore, true, skipUpgradeHeights,
 		cast.ToString(appOpts.Get(flags.FlagHome)),
@@ -247,7 +252,7 @@ func (ac appCreator) newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, 
 		baseapp.SetSnapshotStore(snapshotStore),
 		baseapp.SetSnapshotInterval(cast.ToUint64(appOpts.Get(server.FlagStateSyncSnapshotInterval))),
 		baseapp.SetSnapshotKeepRecent(cast.ToUint32(appOpts.Get(server.FlagStateSyncSnapshotKeepRecent))),
-		baseapp.SetIAVLCacheSize(cast.ToInt(50000000)),
+		baseapp.SetIAVLCacheSize(cast.ToInt(IAVLSize)),
 	)
 }
 
