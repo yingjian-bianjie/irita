@@ -1,6 +1,8 @@
 package app
 
 import (
+	"github.com/bianjieai/irita/aclmapping"
+	acltypes "github.com/cosmos/cosmos-sdk/x/accesscontrol/types"
 	"io"
 	"math"
 	"os"
@@ -20,6 +22,9 @@ import (
 	"github.com/cosmos/cosmos-sdk/x/capability"
 	distrkeeper "github.com/cosmos/cosmos-sdk/x/distribution/keeper"
 
+	aclmodule "github.com/cosmos/cosmos-sdk/x/accesscontrol"
+	aclkeeper "github.com/cosmos/cosmos-sdk/x/accesscontrol/keeper"
+	gethparams "github.com/ethereum/go-ethereum/params"
 	"github.com/spf13/cast"
 
 	abci "github.com/tendermint/tendermint/abci/types"
@@ -141,8 +146,6 @@ import (
 	"github.com/tharsis/ethermint/x/feemarket"
 	feemarketkeeper "github.com/tharsis/ethermint/x/feemarket/keeper"
 	feemarkettypes "github.com/tharsis/ethermint/x/feemarket/types"
-
-	gethparams "github.com/ethereum/go-ethereum/params"
 )
 
 const appName = "IritaApp"
@@ -154,6 +157,7 @@ var (
 	// non-dependant module elements, such as codec registration
 	// and genesis verification.
 	ModuleBasics = module.NewBasicManager(
+		aclmodule.AppModuleBasic{},
 		auth.AppModuleBasic{},
 		genutil.AppModuleBasic{},
 		bank.AppModuleBasic{},
@@ -199,6 +203,7 @@ var (
 	}
 	// module accounts that are allowed to receive tokens
 	allowedReceivingModAcc = map[string]bool{}
+	EmptyACLOpts           []aclkeeper.Option
 )
 
 // Verify app interface at compile time
@@ -242,27 +247,28 @@ type IritaApp struct {
 	memKeys map[string]*sdk.MemoryStoreKey
 
 	// keepers
-	accountKeeper    authkeeper.AccountKeeper
-	bankKeeper       bankkeeper.Keeper
-	slashingKeeper   slashingkeeper.Keeper
-	crisisKeeper     crisiskeeper.Keeper
-	upgradeKeeper    upgradekeeper.Keeper
-	paramsKeeper     paramskeeper.Keeper
-	evidenceKeeper   evidencekeeper.Keeper
-	recordKeeper     recordkeeper.Keeper
-	tokenKeeper      tokenkeeper.Keeper
-	nftKeeper        nftkeeper.Keeper
-	mtKeeper         mtkeeper.Keeper
-	serviceKeeper    servicekeeper.Keeper
-	oracleKeeper     oraclekeeper.Keeper
-	randomKeeper     randomkeeper.Keeper
-	permKeeper       permkeeper.Keeper
-	identityKeeper   identitykeeper.Keeper
-	nodeKeeper       nodekeeper.Keeper
-	opbKeeper        opbkeeper.Keeper
-	feeGrantKeeper   feegrantkeeper.Keeper
-	capabilityKeeper *capabilitykeeper.Keeper
-	wasmKeeper       wasm.Keeper
+	AccessControlKeeper aclkeeper.Keeper
+	accountKeeper       authkeeper.AccountKeeper
+	bankKeeper          bankkeeper.Keeper
+	slashingKeeper      slashingkeeper.Keeper
+	crisisKeeper        crisiskeeper.Keeper
+	upgradeKeeper       upgradekeeper.Keeper
+	paramsKeeper        paramskeeper.Keeper
+	evidenceKeeper      evidencekeeper.Keeper
+	recordKeeper        recordkeeper.Keeper
+	tokenKeeper         tokenkeeper.Keeper
+	nftKeeper           nftkeeper.Keeper
+	mtKeeper            mtkeeper.Keeper
+	serviceKeeper       servicekeeper.Keeper
+	oracleKeeper        oraclekeeper.Keeper
+	randomKeeper        randomkeeper.Keeper
+	permKeeper          permkeeper.Keeper
+	identityKeeper      identitykeeper.Keeper
+	nodeKeeper          nodekeeper.Keeper
+	opbKeeper           opbkeeper.Keeper
+	feeGrantKeeper      feegrantkeeper.Keeper
+	capabilityKeeper    *capabilitykeeper.Keeper
+	wasmKeeper          wasm.Keeper
 	// tibc
 	scopedTIBCKeeper     capabilitykeeper.ScopedKeeper
 	scopedTIBCMockKeeper capabilitykeeper.ScopedKeeper
@@ -287,7 +293,7 @@ type IritaApp struct {
 // NewIritaApp returns a reference to an initialized IritaApp.
 func NewIritaApp(
 	logger log.Logger, db dbm.DB, traceStore io.Writer, loadLatest bool, skipUpgradeHeights map[int64]bool,
-	homePath string, invCheckPeriod uint, encodingConfig simappparams.EncodingConfig, appOpts servertypes.AppOptions, baseAppOptions ...func(*baseapp.BaseApp),
+	homePath string, invCheckPeriod uint, encodingConfig simappparams.EncodingConfig, appOpts servertypes.AppOptions, aclOpts []aclkeeper.Option, baseAppOptions ...func(*baseapp.BaseApp),
 ) *IritaApp {
 	// TODO: Remove cdc in favor of appCodec once all modules are migrated.
 
@@ -325,6 +331,7 @@ func NewIritaApp(
 		tibcnfttypes.StoreKey,
 		tibcmttypes.StoreKey,
 		wasm.StoreKey,
+		acltypes.StoreKey,
 
 		// evm
 		evmtypes.StoreKey, feemarkettypes.StoreKey,
@@ -410,6 +417,16 @@ func NewIritaApp(
 		app.GetSubspace(opbtypes.ModuleName),
 	)
 
+	customDependencyGenerators := aclmapping.NewCustomDependencyGenerator()
+	aclOpts = append(aclOpts, aclkeeper.WithDependencyGeneratorMappings(customDependencyGenerators.GetCustomDependencyGenerators()))
+	app.AccessControlKeeper = aclkeeper.NewKeeper(
+		appCodec,
+		app.keys[acltypes.StoreKey],
+		app.GetSubspace(acltypes.ModuleName),
+		app.accountKeeper,
+		stakingkeeper.Keeper{},
+		aclOpts...,
+	)
 	// evm
 	tracer := cast.ToString(appOpts.Get(srvflags.EVMTracer))
 
@@ -485,6 +502,7 @@ func NewIritaApp(
 	// NOTE: Any module instantiated in the module manager that is later modified
 	// must be passed by reference here.
 	app.mm = module.NewManager(
+		aclmodule.NewAppModule(appCodec, app.AccessControlKeeper),
 		genutil.NewAppModule(app.accountKeeper, app.nodeKeeper, app.BaseApp.DeliverTx, encodingConfig.TxConfig),
 		auth.NewAppModule(appCodec, app.accountKeeper, authsims.RandomGenesisAccounts),
 		bank.NewAppModule(appCodec, app.bankKeeper, app.accountKeeper),
@@ -547,6 +565,7 @@ func NewIritaApp(
 
 		// evm
 		evmtypes.ModuleName, feemarkettypes.ModuleName,
+		acltypes.ModuleName,
 	)
 	app.mm.SetOrderEndBlockers(
 		paramstypes.ModuleName,
@@ -576,6 +595,7 @@ func NewIritaApp(
 
 		// evm
 		evmtypes.ModuleName, feemarkettypes.ModuleName,
+		acltypes.ModuleName,
 	)
 
 	// NOTE: The genutils module must occur after staking so that pools are
@@ -611,6 +631,7 @@ func NewIritaApp(
 
 		// evm
 		evmtypes.ModuleName, feemarkettypes.ModuleName,
+		acltypes.ModuleName,
 	)
 
 	app.mm.SetOrderMigrations(
@@ -641,6 +662,7 @@ func NewIritaApp(
 
 		// evm
 		evmtypes.ModuleName, feemarkettypes.ModuleName,
+		acltypes.ModuleName,
 	)
 
 	app.mm.RegisterInvariants(&app.crisisKeeper)

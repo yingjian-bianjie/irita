@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	aclkeeper "github.com/cosmos/cosmos-sdk/x/accesscontrol/keeper"
 	"io"
 	"os"
 	"path/filepath"
@@ -237,6 +238,7 @@ func (ac appCreator) newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, 
 		cast.ToUint(appOpts.Get(server.FlagInvCheckPeriod)),
 		ac.encCfg, // Ideally, we would reuse the one created by NewRootCmd.
 		appOpts,
+		[]aclkeeper.Option{},
 		baseapp.SetPruning(pruningOpts),
 		baseapp.SetMinGasPrices(cast.ToString(appOpts.Get(server.FlagMinGasPrices))),
 		baseapp.SetHaltHeight(cast.ToUint64(appOpts.Get(server.FlagHaltHeight))),
@@ -281,7 +283,7 @@ func (ac appCreator) appExport(
 		homePath,
 		cast.ToUint(appOpts.Get(server.FlagInvCheckPeriod)),
 		ac.encCfg,
-		appOpts,
+		appOpts, []aclkeeper.Option{},
 	)
 
 	if height != -1 {
