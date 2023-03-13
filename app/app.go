@@ -1,12 +1,17 @@
 package app
 
 import (
+	"fmt"
 	"github.com/bianjieai/irita/aclmapping"
+	aclmappingutils "github.com/bianjieai/irita/aclmapping/utils"
+	sdkacltypes "github.com/cosmos/cosmos-sdk/types/accesscontrol"
+	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
 	acltypes "github.com/cosmos/cosmos-sdk/x/accesscontrol/types"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/irisnet/irismod/modules/mt"
 
@@ -228,6 +233,20 @@ func init() {
 		true,
 		sdk.AccAddress{},
 	)
+}
+
+type ProcessBlockConcurrentFunction func(
+	deliverTxResult chan abci.ResponseDeliverTx,
+	ctx sdk.Context,
+	txs [][]byte,
+	completionSignalingMap map[int]acltypes.MessageCompletionSignalMapping,
+	blockingSignalsMap map[int]acltypes.MessageCompletionSignalMapping,
+	txMsgAccessOpMapping map[int]acltypes.MsgIndexToAccessOpMapping,
+) ([]*abci.ResponseDeliverTx, bool)
+
+type ChannelResult struct {
+	txIndex int
+	result  abci.ResponseDeliverTx
 }
 
 // IritaApp extends an ABCI application, but with most of its parameters exported.
@@ -711,7 +730,7 @@ func NewIritaApp(
 	// initialize BaseApp
 	app.SetInitChainer(app.InitChainer)
 	app.SetBeginBlocker(app.BeginBlocker)
-	anteHandler := appante.NewAnteHandler(
+	anteHandler, anteDepGenerator, err := appante.NewAnteHandler(
 		appante.HandlerOptions{
 			PermKeeper:      app.permKeeper,
 			AccountKeeper:   app.accountKeeper,
@@ -727,6 +746,11 @@ func NewIritaApp(
 			EvmKeeper:          app.EvmKeeper,
 		},
 	)
+	if err != nil {
+		panic(err)
+	}
+	bApp.SetBuildDependenciesAndRunTxs(app.GetBuildDependenciesAndRunTxs(app.AccessControlKeeper, encodingConfig.TxConfig.TxDecoder(), anteDepGenerator))
+	app.SetAnteDepGenerator(anteDepGenerator)
 	app.SetAnteHandler(anteHandler)
 	app.SetEndBlocker(app.EndBlocker)
 
@@ -1046,4 +1070,226 @@ func initParamsKeeper(appCodec codec.BinaryCodec, legacyAmino *codec.LegacyAmino
 	paramsKeeper.Subspace(feemarkettypes.ModuleName)
 
 	return paramsKeeper
+}
+
+func (app *IritaApp) GetBuildDependenciesAndRunTxs(keeper aclkeeper.Keeper, txDecoder sdk.TxDecoder, anteDepGen sdk.AnteDepGenerator) baseapp.BuildDependenciesAndRunTxs {
+
+	return func(ctx sdk.Context, txs [][]byte, responseDeliverTx chan abci.ResponseDeliverTx) ([]*abci.ResponseDeliverTx, sdk.Context) {
+		var txResults []*abci.ResponseDeliverTx
+
+		dependencyDag, err := keeper.BuildDependencyDag(ctx, txDecoder, anteDepGen, txs)
+
+		switch err {
+		case nil:
+			// Start with a fresh state for the MemCache
+			ctx = ctx.WithContextMemCache(sdk.NewContextMemCache())
+			txResults, ctx = app.ProcessTxs(ctx, txs, dependencyDag, responseDeliverTx, app.ProcessBlockConcurrent)
+		/*case acltypes.ErrGovMsgInBlock:
+		ctx.Logger().Info(fmt.Sprintf("Gov msg found while building DAG, processing synchronously: %s", err))
+		txResults = app.ProcessBlockSynchronous(ctx, txs)
+		metrics.IncrDagBuildErrorCounter(metrics.GovMsgInBlock)*/
+		default:
+			ctx.Logger().Error(fmt.Sprintf("Error while building DAG, processing synchronously: %s", err))
+			//txResults = app.ProcessBlockSynchronous(ctx, txs)
+			//metrics.IncrDagBuildErrorCounter(metrics.FailedToBuild)
+		}
+		return txResults, ctx
+	}
+}
+
+/*
+func BuildDependenciesAndRunTxs(ctx sdk.Context, txs [][]byte, deliverTxResult chan abci.ResponseDeliverTx) ([]*abci.ResponseDeliverTx, sdk.Context) {
+	var txResults []*abci.ResponseDeliverTx
+
+	dependencyDag, err := app.accessControlKeeper.BuildDependencyDag(ctx, app.txDecoder, app.GetAnteDepGenerator(), txs)
+
+	switch err {
+	case nil:
+		// Start with a fresh state for the MemCache
+		ctx = ctx.WithContextMemCache(sdk.NewContextMemCache())
+		txResults, ctx = app.ProcessTxs(ctx, txs, dependencyDag, deliverTxResult, app.ProcessBlockConcurrent)
+	/*case acltypes.ErrGovMsgInBlock:
+	ctx.Logger().Info(fmt.Sprintf("Gov msg found while building DAG, processing synchronously: %s", err))
+	txResults = app.ProcessBlockSynchronous(ctx, txs)
+	metrics.IncrDagBuildErrorCounter(metrics.GovMsgInBlock)*/
+/*default:
+	ctx.Logger().Error(fmt.Sprintf("Error while building DAG, processing synchronously: %s", err))
+	//txResults = app.ProcessBlockSynchronous(ctx, txs)
+	//metrics.IncrDagBuildErrorCounter(metrics.FailedToBuild)
+}
+
+return txResults, ctx*/
+//}
+func (app *IritaApp) ProcessTxs(
+	ctx sdk.Context,
+	txs [][]byte,
+	dependencyDag *acltypes.Dag,
+	deliverTxResult chan abci.ResponseDeliverTx,
+	processBlockConcurrentFunction ProcessBlockConcurrentFunction,
+) ([]*abci.ResponseDeliverTx, sdk.Context) {
+	// Only run concurrently if no error
+	// Branch off the current context and pass a cached context to the concurrent delivered TXs that are shared.
+	// runTx will write to this ephermeral CacheMultiStore, after the process block is done, Write() is called on this
+	// CacheMultiStore where it writes the data to the parent store (DeliverState) in sorted Key order to maintain
+	// deterministic ordering between validators in the case of concurrent deliverTXs
+	processBlockCtx, processBlockCache := app.CacheContext(ctx)
+	concurrentResults, ok := processBlockConcurrentFunction(
+		deliverTxResult,
+		processBlockCtx,
+		txs,
+		dependencyDag.CompletionSignalingMap,
+		dependencyDag.BlockingSignalsMap,
+		dependencyDag.TxMsgAccessOpMapping,
+	)
+	if ok {
+		// Write the results back to the concurrent contexts - if concurrent execution fails,
+		// this should not be called and the state is rolled back and retried with synchronous execution
+		processBlockCache.Write()
+		return concurrentResults, ctx
+	}
+	// we need to add the wasm dependencies before we process synchronous otherwise it never gets included
+	ctx.Logger().Error("Concurrent Execution failed, retrying with Synchronous")
+	// Clear the memcache context from the previous state as it failed, we no longer need to commit the data
+	ctx.ContextMemCache().Clear()
+	//txResults := app.ProcessBlockSynchronous(ctx, txs)
+	processBlockCache.Write()
+	return nil, ctx
+}
+
+func (app *IritaApp) ProcessBlockConcurrent(
+	deliverTxResult chan abci.ResponseDeliverTx,
+	ctx sdk.Context,
+	txs [][]byte,
+	completionSignalingMap map[int]acltypes.MessageCompletionSignalMapping,
+	blockingSignalsMap map[int]acltypes.MessageCompletionSignalMapping,
+	txMsgAccessOpMapping map[int]acltypes.MsgIndexToAccessOpMapping,
+) ([]*abci.ResponseDeliverTx, bool) {
+	//defer metrics.BlockProcessLatency(time.Now(), metrics.CONCURRENT)
+
+	txResults := []*abci.ResponseDeliverTx{}
+	// If there's no transactions then return empty results
+	if len(txs) == 0 {
+		return txResults, true
+	}
+
+	var waitGroup sync.WaitGroup
+	resultChan := make(chan ChannelResult, len(txs))
+	// For each transaction, start goroutine and deliver TX
+	for txIndex, txBytes := range txs {
+		waitGroup.Add(1)
+		go app.ProcessTxConcurrent(
+			ctx,
+			txIndex,
+			txBytes,
+			&waitGroup,
+			resultChan,
+			completionSignalingMap[txIndex],
+			blockingSignalsMap[txIndex],
+			txMsgAccessOpMapping[txIndex],
+		)
+	}
+
+	// Do not call waitGroup.Wait() synchronously as it blocks on channel reads
+	// until all the messages are read. This closes the channel once
+	// results are all read and prevent any further writes.
+	go func() {
+		waitGroup.Wait()
+		close(resultChan)
+	}()
+
+	// Gather Results and store it based on txIndex and read results from channel
+	// Concurrent results may be in different order than the original txIndex
+	txResultsMap := map[int]*abci.ResponseDeliverTx{}
+	for result := range resultChan {
+		deliverTxResult <- result.result
+		//txResultsMap[result.txIndex] = result.result
+	}
+
+	// Gather Results and store in array based on txIndex to preserve ordering
+	for txIndex := range txs {
+		txResults = append(txResults, txResultsMap[txIndex])
+	}
+
+	ok := true
+	for i, result := range txResults {
+		if result.GetCode() == sdkerrors.ErrInvalidConcurrencyExecution.ABCICode() {
+			ctx.Logger().Error(fmt.Sprintf("Invalid concurrent execution of deliverTx index=%d", i))
+			//metrics.IncrFailedConcurrentDeliverTxCounter()
+			ok = false
+		}
+	}
+
+	return txResults, ok
+}
+
+func (app *IritaApp) ProcessTxConcurrent(
+	ctx sdk.Context,
+	txIndex int,
+	txBytes []byte,
+	wg *sync.WaitGroup,
+	resultChan chan<- ChannelResult,
+	txCompletionSignalingMap acltypes.MessageCompletionSignalMapping,
+	txBlockingSignalsMap acltypes.MessageCompletionSignalMapping,
+	txMsgAccessOpMapping acltypes.MsgIndexToAccessOpMapping,
+) {
+	defer wg.Done()
+	// Store the Channels in the Context Object for each transaction
+	ctx = ctx.WithTxCompletionChannels(GetChannelsFromSignalMapping(txCompletionSignalingMap))
+	ctx = ctx.WithTxBlockingChannels(GetChannelsFromSignalMapping(txBlockingSignalsMap))
+	ctx = ctx.WithTxMsgAccessOps(txMsgAccessOpMapping)
+	ctx = ctx.WithMsgValidator(
+		sdkacltypes.NewMsgValidator(aclmappingutils.StoreKeyToResourceTypePrefixMap),
+	)
+
+	// Deliver the transaction and store the result in the channel
+	resultChan <- ChannelResult{txIndex, app.BaseApp.OptimisticDeliverTx(
+		abci.RequestDeliverTx{
+			Tx: txBytes,
+		})}
+	//metrics.IncrTxProcessTypeCounter(metrics.CONCURRENT)
+}
+
+/*func (app *BaseApp) ProcessProposalHandler(ctx sdk.Context, req *abci.RequestProcessProposal) (*abci.ResponseProcessProposal, error) {
+	if app.optimisticProcessingInfo == nil {
+		completionSignal := make(chan struct{}, 1)
+		optimisticProcessingInfo := &OptimisticProcessingInfo{
+			Height:     req.Height,
+			Hash:       req.Hash,
+			Completion: completionSignal,
+		}
+		app.optimisticProcessingInfo = optimisticProcessingInfo
+		go func() {
+			events, txResults, endBlockResp, _ := app.ProcessBlock(ctx, req.Txs, req, req.ProposedLastCommit)
+			optimisticProcessingInfo.Events = events
+			optimisticProcessingInfo.TxRes = txResults
+			optimisticProcessingInfo.EndBlockResp = endBlockResp
+			optimisticProcessingInfo.Completion <- struct{}{}
+		}()
+	} else if !bytes.Equal(app.optimisticProcessingInfo.Hash, req.Hash) {
+		app.optimisticProcessingInfo.Aborted = true
+	}
+	return &abci.ResponseProcessProposal{
+		Status: abci.ResponseProcessProposal_ACCEPT,
+	}, nil
+}*/
+
+func GetChannelsFromSignalMapping(signalMapping acltypes.MessageCompletionSignalMapping) sdkacltypes.MessageAccessOpsChannelMapping {
+	channelsMapping := make(sdkacltypes.MessageAccessOpsChannelMapping)
+	for messageIndex, accessOperationsToSignal := range signalMapping {
+		channelsMapping[messageIndex] = make(sdkacltypes.AccessOpsChannelMapping)
+		for accessOperation, completionSignals := range accessOperationsToSignal {
+			var channels []chan interface{}
+			for _, completionSignal := range completionSignals {
+				channels = append(channels, completionSignal.Channel)
+			}
+			channelsMapping[messageIndex][accessOperation] = channels
+		}
+	}
+	return channelsMapping
+}
+
+func (app *IritaApp) CacheContext(ctx sdk.Context) (sdk.Context, sdk.CacheMultiStore) {
+	ms := ctx.MultiStore()
+	msCache := ms.CacheMultiStore()
+	return ctx.WithMultiStore(msCache), msCache
 }

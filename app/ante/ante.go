@@ -2,6 +2,8 @@ package ante
 
 import (
 	"fmt"
+	"github.com/bianjieai/irita/app/antedecorators"
+	"github.com/bianjieai/irita/app/antedecorators/depdecorators"
 	"runtime/debug"
 
 	"github.com/bianjieai/irita/modules/gas"
@@ -52,7 +54,17 @@ type HandlerOptions struct {
 // NewAnteHandler returns an AnteHandler that checks and increments sequence
 // numbers, checks signatures & account numbers, deducts fees from the first
 // signer, and performs other module-specific logic.
-func NewAnteHandler(options HandlerOptions) sdk.AnteHandler {
+func NewAnteHandler(options HandlerOptions) (sdk.AnteHandler, sdk.AnteDepGenerator, error) {
+	anteHandler := getAnteHandler(options)
+	anteDepGenerator, err := getDepGenerator(options)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return anteHandler, anteDepGenerator, nil
+}
+
+func getAnteHandler(options HandlerOptions) sdk.AnteHandler {
 	return func(
 		ctx sdk.Context, tx sdk.Tx, sim bool,
 	) (newCtx sdk.Context, err error) {
@@ -124,6 +136,39 @@ func NewAnteHandler(options HandlerOptions) sdk.AnteHandler {
 		return anteHandler(ctx, tx, sim)
 
 	}
+}
+
+func getDepGenerator(options HandlerOptions) (sdk.AnteDepGenerator, error) {
+	/*if options.AccountKeeper == nil {
+		return nil, sdkerrors.Wrap(sdkerrors.ErrLogic, "account keeper is required for AnteHandler")
+	}*/
+	if options.BankKeeper == nil {
+		return nil, sdkerrors.Wrap(sdkerrors.ErrLogic, "bank keeper is required for AnteHandler")
+	}
+
+	sequentialVerifyDecorator := ante.NewSigVerificationDecorator(options.AccountKeeper, options.SignModeHandler)
+	anteDecorators := []sdk.AnteFullDecorator{
+		sdk.CustomDepWrappedAnteDecorator(ante.NewSetUpContextDecorator(), depdecorators.GasMeterSetterDecorator{}), // outermost AnteDecorator. SetUpContext must be called first
+		// TODO: have dex antehandler separate, and then call the individual antehandlers FROM the gasless antehandler decorator wrapper
+		antedecorators.NewGaslessDecorator([]sdk.AnteFullDecorator{ante.NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper)}),
+		sdk.DefaultWrappedAnteDecorator(ante.NewRejectExtensionOptionsDecorator()),
+		sdk.DefaultWrappedAnteDecorator(ante.NewValidateBasicDecorator()),
+		sdk.DefaultWrappedAnteDecorator(ante.NewTxTimeoutHeightDecorator()),
+		sdk.DefaultWrappedAnteDecorator(ante.NewValidateMemoDecorator(options.AccountKeeper)),
+		ante.NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
+		// PriorityDecorator must be called after DeductFeeDecorator which sets tx priority based on tx fees
+		sdk.DefaultWrappedAnteDecorator(antedecorators.NewPriorityDecorator()),
+		// SetPubKeyDecorator must be called before all signature verification decorators
+		sdk.CustomDepWrappedAnteDecorator(ante.NewSetPubKeyDecorator(options.AccountKeeper), depdecorators.SignerDepDecorator{ReadOnly: false}),
+		sdk.DefaultWrappedAnteDecorator(ante.NewValidateSigCountDecorator(options.AccountKeeper)),
+		sdk.CustomDepWrappedAnteDecorator(ante.NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer), depdecorators.SignerDepDecorator{ReadOnly: true}),
+		sdk.CustomDepWrappedAnteDecorator(sequentialVerifyDecorator, depdecorators.SignerDepDecorator{ReadOnly: true}),
+		sdk.CustomDepWrappedAnteDecorator(ante.NewIncrementSequenceDecorator(options.AccountKeeper), depdecorators.SignerDepDecorator{ReadOnly: false}),
+	}
+
+	anteDepGenerator := sdk.ChainAnteDecoratorDepGenerators(anteDecorators...)
+
+	return anteDepGenerator, nil
 }
 
 func Recover(logger tmlog.Logger, err *error) {
