@@ -1245,7 +1245,7 @@ func (app *IritaApp) ProcessTxConcurrent(
 	resultChan <- ChannelResult{txIndex, app.BaseApp.OptimisticDeliverTx(
 		abci.RequestDeliverTx{
 			Tx: txBytes,
-		})}
+		}, ctx)}
 	//metrics.IncrTxProcessTypeCounter(metrics.CONCURRENT)
 }
 
